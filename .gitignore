@@ -1,0 +1,15 @@
+# Credentials, downloaded executables and local evidence never belong in Git.
+bin/
+.cache/
+.local/
+auth.json
+config.toml
+quota-confirmation.json*
+.download-*
+work/
+outputs/
+*.log
+*.jsonl
+*.zip
+*.tar.gz
+.DS_Store
