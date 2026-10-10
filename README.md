@@ -21,6 +21,17 @@ ln -s "$PWD/skills/x-premium-cli" "$HOME/.claude/skills/x-premium-cli"
 
 Complete sign-in in the official browser page. Setup downloads the official CLI (~168 MB) once and verifies its pinned hash and xAI signature. The binary stays in `~/.cache/x-premium-cli/`; credentials stay in `~/.local/share/x-premium-cli/auth/`.
 
+### Codex plugin
+
+Alternatively, install the same Skill as a Codex plugin:
+
+```bash
+codex plugin marketplace add ryokobachan/x-premium-cli
+codex plugin add x-premium-cli@x-premium-cli
+```
+
+Invoke `$x-premium-cli:x-premium-cli` in a new Codex chat. The plugin only packages the existing Skill; it uses the same setup, OAuth credentials, and subscription checks.
+
 ## Use
 
 Ask your agent to use `x-premium-cli`, or run directly:
