@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { childEnvironment, billingSummary, enforceSubscriptionOnly, normalizeResponse, requestPayload, extractPosts, readBoundedJson, validateQuotaConfirmation, storagePaths, writeBinaryStream } from '../skills/x-premium-cli/x-premium-cli.mjs';
+import { childEnvironment, billingSummary, enforceSubscriptionOnly, normalizeResponse, requestPayload, extractPosts, readBoundedJson, storagePaths, writeBinaryStream } from '../skills/x-premium-cli/x-premium-cli.mjs';
 
 const valid = {subscription_tier:'XPremium',on_demand_cap_cents:0,on_demand_used_cents:0,prepaid_balance_cents:0,auto_topup_enabled:false,credit_usage_percent:5};
 
@@ -19,13 +19,14 @@ test('child process does not inherit API keys, arbitrary routes, or auth overrid
   assert.notEqual(env.GROK_HOME,'/evil'); assert.equal(env.OTEL_LOG_RAW_API_BODIES,undefined);
 });
 
-test('subscription guard requires evidence and never treats missing fields as zero',()=>{
+test('subscription guard requires paid billing evidence but does not require quota',()=>{
   assert.equal(enforceSubscriptionOnly(valid),true);
-  for(const change of [{on_demand_cap_cents:null},{on_demand_cap_cents:100},{prepaid_balance_cents:100},{prepaid_balance_cents:null},{on_demand_used_cents:null},{auto_topup_enabled:true},{auto_topup_enabled:null},{credit_usage_percent:null},{credit_usage_percent:-1},{credit_usage_percent:100},{subscription_tier:'Free'},{subscription_tier:'SuperGrok'}]) {
+  for(const change of [{on_demand_cap_cents:null},{on_demand_cap_cents:100},{prepaid_balance_cents:100},{prepaid_balance_cents:null},{on_demand_used_cents:null},{auto_topup_enabled:true},{auto_topup_enabled:null},{subscription_tier:'Free'},{subscription_tier:'SuperGrok'}]) {
     assert.throws(()=>enforceSubscriptionOnly({...valid,...change}));
   }
   const missing=billingSummary({subscriptionTier:'XPremium'},{config:{}});
   assert.equal(missing.on_demand_cap_cents,null); assert.equal(missing.prepaid_balance_cents,null);
+  for(const quota of [undefined,null,-1,100,NaN]) assert.equal(enforceSubscriptionOnly({...valid,credit_usage_percent:quota}),true);
 });
 
 test('billing parser rejects invalid cents and identity labels',()=>{
@@ -33,26 +34,77 @@ test('billing parser rejects invalid cents and identity labels',()=>{
   assert.equal(s.subscription_tier,null);assert.equal(s.on_demand_cap_cents,null);assert.equal(s.on_demand_used_cents,null);assert.equal(s.credit_usage_percent,null);
 });
 
-test('period-only unified response does not prove included capacity',()=>{
+test('period-only unified response preserves unknown quota without blocking subscription access',()=>{
   const s=billingSummary({subscriptionTier:'XPremium'},{config:{
     currentPeriod:{type:'USAGE_PERIOD_TYPE_WEEKLY',start:'2025-01-01T00:00:00Z',end:'2025-01-08T00:00:00Z'},
     onDemandCap:{},onDemandUsed:{},prepaidBalance:{},isUnifiedBillingUser:true,
   }},{rule:{enabled:false}});
   assert.equal(s.credit_usage_percent,null);
-  assert.throws(()=>enforceSubscriptionOnly(s),{code:'INCLUDED_QUOTA_UNAVAILABLE'});
+  assert.equal(enforceSubscriptionOnly(s),true);
 });
 
-test('human or computer-use official UI confirmation is account-bound, period-bound and expires',()=>{
-  const now=Date.parse('2025-01-06T05:00:00Z'),p={type:'USAGE_PERIOD_TYPE_WEEKLY',start:'2025-01-01T00:00:00Z',end:'2025-01-08T00:00:00Z'};
-  const w={source:'human_official_usage_ui',account_binding:'account-a',used_percent:0,period_start:p.start,period_end:p.end,verified_at:new Date(now).toISOString()};
-  assert.equal(validateQuotaConfirmation(w,'account-a',p,now),true);
-  assert.equal(validateQuotaConfirmation({...w,source:'computer_use_official_usage_ui'},'account-a',p,now),true);
-  assert.equal(validateQuotaConfirmation({...w,source:'computer_use_official_usage_ui'},'account-a',p,now+120000),false);
-  assert.equal(validateQuotaConfirmation(w,'account-b',p,now),false);
-  assert.equal(validateQuotaConfirmation(w,'account-a',p,now+120000),false);
-  assert.equal(validateQuotaConfirmation(w,'account-a',{...p,end:'2025-01-09T00:00:00Z'},now),false);
-  assert.equal(validateQuotaConfirmation({...w,used_percent:100},'account-a',p,now),false);
-  assert.equal(validateQuotaConfirmation({...w,source:'inferred'},'account-a',p,now),false);
+test('CLI submits without quota confirmation and stops on provider limits or unsafe paid billing',async t=>{
+  const home=await mkdtemp(path.join(tmpdir(),'x-premium-quota-optional-'));
+  const paths=storagePaths(home),log=path.join(home,'requests.json'),mock=path.join(home,'mock-fetch.mjs');
+  const helper=fileURLToPath(new URL('../skills/x-premium-cli/x-premium-cli.mjs',import.meta.url));
+  await mkdir(paths.auth_home,{recursive:true,mode:0o700});
+  await writeFile(path.join(paths.auth_home,'auth.json'),JSON.stringify({
+    'https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828':{
+      auth_mode:'oidc',oidc_issuer:'https://auth.x.ai',oidc_client_id:'b1a00492-073a-47ea-816f-4c329264a828',
+      key:'test-only-oauth-access',refresh_token:'test-only-oauth-refresh',user_id:'test-account',
+      expires_at:new Date(Date.now()+86400000).toISOString(),principal_type:'Personal',
+    },
+  }),{mode:0o600});
+  await writeFile(mock,String.raw`
+import assert from 'node:assert/strict';
+import {writeFileSync} from 'node:fs';
+const calls=[],scenario=process.env.X_PREMIUM_TEST_SCENARIO;
+const json=(body,status=200)=>new Response(JSON.stringify(body),{status,headers:{'Content-Type':'application/json'}});
+globalThis.fetch=async (url,options)=>{
+  const parsed=new URL(url);assert.equal(parsed.origin,'https://cli-chat-proxy.grok.com');
+  assert.equal(options.headers.Authorization,'Bearer test-only-oauth-access');
+  calls.push({method:options.method,path:parsed.pathname});writeFileSync(process.env.X_PREMIUM_TEST_LOG,JSON.stringify(calls));
+  if(options.method==='POST') {
+    assert.equal(parsed.pathname,'/v1/responses');
+    if(scenario==='exhausted')return json({error:'subscription limit reached'},429);
+    const payload=JSON.parse(options.body),tool=payload.tools[0]?.type;
+    const output=[{type:'message',content:[{type:'output_text',text:'Mock response'}]}];
+    if(tool==='x_search')output.unshift({type:'custom_tool_call',call_id:'xs_test',status:'completed'});
+    if(tool==='web_search')output.unshift({type:'web_search_call',status:'completed'});
+    return json({model:payload.model,output});
+  }
+  assert.equal(options.method,'GET');
+  if(parsed.pathname==='/v1/user')return json({userId:'test-account',subscriptionTier:'XPremium'});
+  if(parsed.pathname==='/v1/billing')return json({config:{onDemandCap:scenario==='paid'?{val:100}:{},onDemandUsed:{},prepaidBalance:{},...(scenario==='exhausted'?{creditUsagePercent:100}:{})}});
+  if(parsed.pathname==='/v1/auto-topup-rule')return json({});
+  if(parsed.pathname==='/v1/models')return json({data:[{id:'grok-4.7'}]});
+  throw new Error('Unexpected route');
+};
+`);
+  try {
+    for(const [scenario,mode] of [['missing','chat'],['missing','x-search'],['missing','web-search'],['exhausted','x-search'],['paid','x-search']]) {
+      await t.test(`${scenario}: ${mode}`,async()=>{
+        const result=spawnSync(process.execPath,['--import',mock,helper,mode,'Test query'],{
+          env:{HOME:home,PATH:process.env.PATH,X_PREMIUM_TEST_SCENARIO:scenario,X_PREMIUM_TEST_LOG:log},encoding:'utf8',timeout:10000,
+        });
+        assert.equal(result.status,scenario==='missing'?0:1,result.stderr);
+        const data=JSON.parse(result.stdout),calls=JSON.parse(await readFile(log,'utf8'));
+        assert.equal(calls.filter(c=>c.method==='POST').length,scenario==='paid'?0:1);
+        if(scenario==='missing') {
+          assert.equal(data.ok,true);assert.equal(data.billing_before.credit_usage_percent,null);
+          assert.equal(data.billing_before.subscription_only_guard,'PASS');assert.equal(data.search_execution_verified,true);
+          assert.equal(data.paid_usage_unchanged,true);assert.equal(data.further_requests_allowed,true);
+        } else {
+          assert.equal(data.ok,false);
+          assert.equal(data.code,scenario==='paid'?'ZERO_ON_DEMAND_CAP_UNCONFIRMED':'SUBSCRIPTION_HTTP_429');
+          if(scenario==='exhausted')assert.equal(data.further_requests_allowed,false);
+        }
+        assert.ok(!result.stdout.includes('test-only-oauth'));
+        await assert.rejects(access(path.join(paths.data_home,'quota')),{code:'ENOENT'});
+        await assert.rejects(access(paths.cache_home),{code:'ENOENT'});
+      });
+    }
+  } finally {await rm(home,{recursive:true,force:true});}
 });
 
 test('official proto3 zero representations differ from missing billing evidence',()=>{

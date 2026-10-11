@@ -3,7 +3,7 @@
 // No external Node packages, API keys, alternate endpoints, or background service.
 import { spawn } from 'node:child_process';
 import { createReadStream, realpathSync } from 'node:fs';
-import { readFile, lstat, mkdir, chmod, writeFile, rename, open, link, unlink } from 'node:fs/promises';
+import { readFile, lstat, mkdir, chmod, writeFile, open, link, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { get as httpsGet } from 'node:https';
@@ -14,12 +14,11 @@ export function storagePaths(home = homedir()) {
   if (!path.isAbsolute(home)) throw new SafeError('ABSOLUTE_HOME_REQUIRED');
   const data = path.join(home, '.local', 'share', 'x-premium-cli');
   const cache = path.join(home, '.cache', 'x-premium-cli');
-  return { data_home: data, auth_home: path.join(data, 'auth'), quota_home: path.join(data, 'quota'),
+  return { data_home: data, auth_home: path.join(data, 'auth'),
     cache_home: cache, official_binary: path.join(cache, 'grok-1.0.50-macos-aarch64') };
 }
 const PATHS = storagePaths();
 export const AUTH_HOME = PATHS.auth_home;
-export const QUOTA_HOME = PATHS.quota_home;
 const BIN = PATHS.official_binary;
 const BINARY_URL = 'https://x.ai/cli/grok-1.0.50-macos-aarch64';
 const BINARY_BYTES = 167936736;
@@ -28,8 +27,6 @@ const PROXY = 'https://cli-chat-proxy.grok.com/v1';
 const CLIENT = 'b1a00492-073a-47ea-816f-4c329264a828';
 const MAX_BYTES = 1024 * 1024;
 const CONFIG = '[auth]\npreferred_method = "oidc"\ndisable_api_key_auth = true\n[cli]\nuse_leader = false\nauto_update = false\n';
-const QUOTA_CONFIRMATION = path.join(QUOTA_HOME, 'quota-confirmation.json');
-const CONFIRMATION_TTL_MS = 120000;
 const SNAPSHOT_AUTH = Symbol('snapshotAuth');
 
 export class SafeError extends Error {
@@ -130,53 +127,12 @@ export function enforceNoPaidBilling(summary) {
 }
 
 export function enforceSubscriptionOnly(summary) {
-  enforceNoPaidBilling(summary);
-  if (!Number.isFinite(summary.credit_usage_percent) || summary.credit_usage_percent < 0 || summary.credit_usage_percent >= 100) throw new SafeError('INCLUDED_QUOTA_UNAVAILABLE');
-  return true;
+  return enforceNoPaidBilling(summary);
 }
 
 function accountBinding(auth) {
   if (typeof auth.user_id !== 'string' || !auth.user_id) throw new SafeError('ACCOUNT_BINDING_UNAVAILABLE');
   return createHash('sha256').update(auth.user_id).digest('hex');
-}
-
-export function validateQuotaConfirmation(witness, binding, period, now = Date.now()) {
-  const verified = Date.parse(witness?.verified_at);
-  const start = Date.parse(period?.start), end = Date.parse(period?.end);
-  return ['human_official_usage_ui','computer_use_official_usage_ui'].includes(witness?.source) && witness.account_binding === binding &&
-    Number.isFinite(verified) && now >= verified && now - verified < CONFIRMATION_TTL_MS &&
-    Number.isFinite(start) && Number.isFinite(end) && start <= now && now < end &&
-    period?.type === 'USAGE_PERIOD_TYPE_WEEKLY' && witness.period_start === period.start && witness.period_end === period.end &&
-    Number.isFinite(witness.used_percent) && witness.used_percent >= 0 && witness.used_percent < 100;
-}
-
-async function quotaConfirmation(auth, period) {
-  try {
-    const st = await lstat(QUOTA_CONFIRMATION);
-    if (!st.isFile() || st.isSymbolicLink() || st.size > 4096 || st.uid !== process.getuid() || (st.mode & 0o077)) return null;
-    const w = JSON.parse(await readFile(QUOTA_CONFIRMATION, 'utf8'));
-    return validateQuotaConfirmation(w, accountBinding(auth), period) ? w : null;
-  } catch { return null; }
-}
-
-async function confirmQuota(percent, origin = 'human', observedAt) {
-  if (!Number.isFinite(percent) || percent < 0 || percent >= 100 || !['human','computer-use'].includes(origin)) throw new SafeError('INVALID_OFFICIAL_UI_QUOTA_CONFIRMATION');
-  if (origin === 'computer-use' && (typeof observedAt !== 'string' || !Number.isFinite(Date.parse(observedAt)))) throw new SafeError('OFFICIAL_UI_OBSERVATION_TIME_REQUIRED');
-  observedAt ??= new Date().toISOString();
-  const auth = await loadAuth();
-  const user = await get(auth, '/user?include=subscription');
-  if (/team/i.test(user.principalType ?? '') || user.teamId) throw new SafeError('PERSONAL_X_PREMIUM_ACCOUNT_REQUIRED');
-  const billing = await get(auth, '/billing?format=credits', { 'x-userid': user.userId });
-  const topup = await get(auth, '/auto-topup-rule', { 'x-userid': user.userId });
-  enforceNoPaidBilling(billingSummary(user, billing, topup));
-  if (Object.hasOwn(billing.config ?? {}, 'creditUsagePercent')) throw new SafeError('USE_LIVE_QUOTA_INSTEAD_OF_HUMAN_CONFIRMATION');
-  const p = billing.config?.currentPeriod;
-  const witness = { source: origin === 'computer-use' ? 'computer_use_official_usage_ui' : 'human_official_usage_ui', account_binding: accountBinding(auth), used_percent: percent,
-    period_start: p?.start, period_end: p?.end, verified_at: observedAt };
-  if (!validateQuotaConfirmation(witness, accountBinding(auth), p)) throw new SafeError('VALID_WEEKLY_PERIOD_REQUIRED');
-  await privateDirectory(QUOTA_HOME, true);
-  await writeFile(QUOTA_CONFIRMATION, JSON.stringify(witness), { mode: 0o600 }); await chmod(QUOTA_CONFIRMATION, 0o600);
-  return { ok: true, confirmed_used_percent: percent, confirmation_source: witness.source, expires_in_seconds: CONFIRMATION_TTL_MS / 1000, inference_requests_allowed: 1 };
 }
 
 export async function status(fetchImpl = fetch) {
@@ -191,14 +147,6 @@ export async function status(fetchImpl = fetch) {
   const topup = await get(auth, '/auto-topup-rule', { 'x-userid': id }, fetchImpl);
   const summary = billingSummary(user, billing, topup);
   summary.quota_source = summary.credit_usage_percent === null ? 'unavailable' : 'live_billing_api';
-  if (!Object.hasOwn(billing.config ?? {}, 'creditUsagePercent')) {
-    const w = await quotaConfirmation(auth, billing.config?.currentPeriod);
-    if (w) {
-      summary.credit_usage_percent = w.used_percent;
-      summary.quota_source = w.source === 'computer_use_official_usage_ui' ? 'computer_use_official_ui_single_request' : 'human_official_ui_single_request';
-      summary.quota_confirmation_valid_until = new Date(Date.parse(w.verified_at) + CONFIRMATION_TTL_MS).toISOString();
-    }
-  }
   let guard = 'PASS';
   try { enforceSubscriptionOnly(summary); } catch (e) { guard = e.code; }
   const result = { ok: guard === 'PASS', authenticated: true, official_oauth: true, expires_at: auth.expires_at ?? null,
@@ -357,12 +305,6 @@ async function search(mode, query, model) {
   if (!/^grok-[A-Za-z0-9._-]{1,70}$/.test(model)) throw new SafeError('INVALID_MODEL');
   const catalog = await get(auth, '/models');
   if (!(catalog.data ?? []).some(m => (m.id ?? m.name) === model)) throw new SafeError('MODEL_NOT_IN_SUBSCRIPTION_CATALOG');
-  if (['human_official_ui_single_request','computer_use_official_ui_single_request'].includes(before.quota_source)) {
-    if (Date.parse(before.quota_confirmation_valid_until) <= Date.now()) throw new SafeError('OFFICIAL_UI_QUOTA_CONFIRMATION_EXPIRED');
-    // Atomic single-use claim: two clients cannot spend the same UI confirmation twice.
-    try { await rename(QUOTA_CONFIRMATION, QUOTA_CONFIRMATION + '.consumed'); }
-    catch (e) { throw new SafeError(e.code === 'ENOENT' ? 'OFFICIAL_UI_QUOTA_CONFIRMATION_ALREADY_CONSUMED' : 'OFFICIAL_UI_QUOTA_STATE_NOT_WRITABLE'); }
-  }
   const instruction = mode === 'x-search' ? 'Use x_search to answer. Include direct X post URLs and original post timestamps when available. Do not invent missing posts or dates.\n\n' :
     mode === 'web-search' ? 'Use web_search to answer. Include source URLs.\n\n' : '';
   const started = Date.now();
@@ -395,13 +337,13 @@ async function search(mode, query, model) {
     mode, requested_model: model, ...normalized, posts: extractPosts((normalized?.answer ?? '') + '\n' + (normalized?.citations ?? []).join('\n')),
     search_execution_verified: toolVerified, elapsed_ms: Date.now() - started,
     billing_before: before, billing_after: after, paid_usage_unchanged: paidUnchanged,
-    further_requests_allowed: after.subscription_only_guard === 'PASS' };
+    further_requests_allowed: ok && after.subscription_only_guard === 'PASS' };
 }
 
 async function main() {
   const [mode = 'help', ...rest] = process.argv.slice(2);
   if (mode === 'help') {
-    console.log('Usage: node x-premium-cli.mjs paths | setup [existing-official-binary] | status | models | login | confirm-quota <official-ui-percent> [computer-use <observed-at-iso>] | chat|x-search|web-search "query" [grok-model]'); return;
+    console.log('Usage: node x-premium-cli.mjs paths | setup [existing-official-binary] | status | models | login | chat|x-search|web-search "query" [grok-model]'); return;
   }
   if (mode === 'paths') {
     console.log(JSON.stringify({ ok: true, ...PATHS }, null, 2)); return;
@@ -420,7 +362,6 @@ async function main() {
   }
   let result;
   if (mode === 'status') result = await status();
-  else if (mode === 'confirm-quota') result = await confirmQuota(rest[0]?.trim() ? Number(rest[0]) : NaN, rest[1] ?? 'human', rest[2]);
   else if (mode === 'models') {
     const auth = await loadAuth(); const models = await get(auth, '/models');
     result = { ok: true, models: (models.data ?? []).map(m => m.id ?? m.name).filter(v => typeof v === 'string' && /^grok-[A-Za-z0-9._-]+$/.test(v)) };

@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "x-premium-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Grok chat and search through X Premium OAuth subscription access.",
   "license": "MIT"
 }

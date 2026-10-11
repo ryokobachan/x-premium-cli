@@ -2,7 +2,7 @@
 
 Use Grok chat, official `x_search`, and `web_search` from Codex CLI and Claude Code through a shared Skill.
 
-Uses X Premium OAuth subscription access only. No API keys, pay-as-you-go API, or prepaid credits. Requests stop when quota or billing status cannot be verified.
+Uses X Premium OAuth subscription access only. No API keys, pay-as-you-go API, or prepaid credits. Paid billing checks remain mandatory; quota checks are optional.
 
 The [search tool is provided by xAI](https://docs.x.ai/developers/tools/x-search); this integration is unofficial. No npm dependencies or background server.
 
@@ -42,6 +42,6 @@ node skills/x-premium-cli/x-premium-cli.mjs x-search "Find two recent OpenAIDevs
 node skills/x-premium-cli/x-premium-cli.mjs web-search "Find the latest official xAI announcement"
 ```
 
-Use `status` for quota and billing checks, `models` for available models, and `paths` for storage locations. Run `login` again when authentication expires. Timestamps derived from post IDs are marked as unverified.
+Use `status` only when you want quota and billing information, `models` for available models, and `paths` for storage locations. Missing quota information does not block requests. Subscription-limit errors stop the request without retries or paid fallback. Run `login` yourself when authentication expires; agents must not launch or control a browser for X workflows. Timestamps derived from post IDs are marked as unverified.
 
 Local tests: `node --test tests/x-premium-cli.test.mjs`.
